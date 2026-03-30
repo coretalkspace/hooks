@@ -10,4 +10,4 @@ The default fediverse portal this stack targets is **[coretalk.space](https://co
 
 ## License
 
-[CORE](LICENSE) License.
+[CORE License](LICENSE).

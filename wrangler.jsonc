@@ -1,5 +1,5 @@
 {
-  "name": "coretalk-hooks",
+  "name": "hooks",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-25",
 
@@ -25,10 +25,10 @@
   // Value must be JSON: a single IP as a JSON string, e.g. "203.0.113.10"
   // or multiple IPs as a JSON array, e.g. ["203.0.113.10","198.51.100.7"]
 
-  // Optional but recommended for production routing
+  // Optional: custom hostname (no path or * — required for custom_domain)
   "routes": [
     {
-      "pattern": "hooks.coretalk.space/*",
+      "pattern": "hooks.coretalk.space",
       "custom_domain": true
     }
   ],
