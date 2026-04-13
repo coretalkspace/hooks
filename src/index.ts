@@ -1,98 +1,106 @@
-import { DurableObject } from "cloudflare:workers";
-
 export interface Env {
-  CORETALK_HOOKS_ROOMS: DurableObjectNamespace;
-  /** JSON string: either one IP (`"x.x.x.x"`) or an array (`["a","b"]`). */
+  /** Base URL, e.g. https://coretalk.space (no trailing slash) */
+  MISSKEY_ORIGIN: string;
+  /** Misskey API token (`i`) — use secret in production */
+  MISSKEY_TOKEN: string;
+  /** JSON string: one IP or array of IPs for webhook allowlist */
   ALLOWED_IPS?: string;
 }
 
-type OutEvent =
-  | {
-      type: "notify";
-      header: string;
-      body: string;
-      icon?: string;
-      ts: number;
-    }
-  | {
-      type: "toast";
-      body: string;
-      ts: number;
-    }
-  | {
-      type: "dialog";
-      title: string;
-      body: string;
-      kind?: "info" | "success" | "warning" | "error" | "question";
-      ts: number;
-    }
-  | {
-      type: "confirm";
-      title: string;
-      body: string;
-      url: string;
-      kind?: "info" | "success" | "warning" | "error" | "question";
-      ts: number;
-    };
+/** Minimum delay between Misskey API calls (rate limiting). */
+const API_CALL_GAP_MS = 150;
+/** Max recipients per `notes/create` (specified visibility); chunk above this. */
+const MAX_VISIBLE_USERS_PER_NOTE = 20;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // WebSocket endpoint
-    if (url.pathname.startsWith("/ws/")) {
-      const username = clean(url.pathname.slice(4));
-      if (!username) return new Response("Bad username", { status: 400 });
-
-      const id = env.CORETALK_HOOKS_ROOMS.idFromName(username);
-      return env.CORETALK_HOOKS_ROOMS.get(id).fetch(request);
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
     }
 
-    // Webhook endpoint
-    if (request.method === "POST") {
-      const username = clean(url.pathname.slice(1));
-      if (!username) return new Response("Bad username", { status: 400 });
+    const allowedIPs = parseAllowedIPs(env.ALLOWED_IPS);
+    const ip =
+      request.headers.get("CF-Connecting-IP") ||
+      request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+      "";
 
-      const allowedIPs = parseAllowedIPs(env.ALLOWED_IPS);
+    if (!allowedIPs.includes(ip)) {
+      return new Response("Forbidden", { status: 403 });
+    }
 
-      const ip =
-        request.headers.get("CF-Connecting-IP") ||
-        request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
-        "";
+    const payload = await request.json().catch(() => null);
+    if (!payload || typeof payload !== "object") {
+      return new Response("Bad JSON", { status: 400 });
+    }
 
-      if (!allowedIPs.includes(ip)) {
-        return new Response("Forbidden", { status: 403 });
-      }
-
-      const payload = await request.json().catch(() => null);
-      if (!payload || typeof payload !== "object") {
-        return new Response("Bad JSON", { status: 400 });
-      }
-
-      const event = buildEvent(payload as Record<string, unknown>);
-      if (!event) {
-        return new Response("Bad payload", { status: 400 });
-      }
-
-      const id = env.CORETALK_HOOKS_ROOMS.idFromName(username);
-      await env.CORETALK_HOOKS_ROOMS.get(id).fetch("https://internal/publish", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(event)
+    const rec = payload as Record<string, unknown>;
+    const pathUser = cleanPathUser(url.pathname);
+    const users = collectTargetUsers(rec, pathUser);
+    if (users.length === 0) {
+      return new Response("Bad username: set path /:user or body.users", {
+        status: 400
       });
-
-      return new Response(null, { status: 204 });
     }
 
-    return new Response("Not found", { status: 404 });
+    const event = buildEvent(rec);
+    if (!event) {
+      return new Response("Bad payload", { status: 400 });
+    }
+
+    const text = eventToMisskeyText(event);
+    const result = await sendDirectMessage(env, users, text);
+
+    if (result.errors.length > 0 && result.sent === 0) {
+      return Response.json(
+        { ok: false, sent: 0, errors: result.errors },
+        { status: 502 }
+      );
+    }
+
+    if (result.errors.length > 0) {
+      return Response.json({
+        ok: true,
+        sent: result.sent,
+        errors: result.errors
+      });
+    }
+
+    return new Response(null, { status: 204 });
   }
 };
+
+function cleanPathUser(pathname: string): string {
+  const seg = pathname.replace(/^\//, "").split("/")[0] ?? "";
+  return clean(seg);
+}
 
 function clean(v: string): string {
   return v.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
 }
 
-/** Secret is JSON: one IP as a string, or several as a string array. */
+function collectTargetUsers(
+  payload: Record<string, unknown>,
+  pathUser: string
+): string[] {
+  const raw = payload.users ?? payload.to;
+  let list: unknown[] = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === "string" && raw.trim()) {
+    list = raw.split(/[\s,]+/);
+  } else if (pathUser) {
+    return [pathUser];
+  }
+  const out = list
+    .map((x) => (typeof x === "string" ? clean(x) : ""))
+    .filter(Boolean);
+  const uniq = [...new Set(out)];
+  if (uniq.length > 0) return uniq;
+  return pathUser ? [pathUser] : [];
+}
+
 function parseAllowedIPs(raw: string | undefined): string[] {
   const t = (raw ?? "").trim();
   if (!t) return [];
@@ -115,13 +123,144 @@ function parseAllowedIPs(raw: string | undefined): string[] {
   return [];
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function misskeyOrigin(env: Env): string {
+  return env.MISSKEY_ORIGIN.replace(/\/$/, "");
+}
+
+async function misskeyApi<T>(
+  env: Env,
+  path: string,
+  body: Record<string, unknown>
+): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string }> {
+  const url = `${misskeyOrigin(env)}/api${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...body, i: env.MISSKEY_TOKEN })
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    return { ok: false, status: res.status, text };
+  }
+  try {
+    return { ok: true, data: JSON.parse(text) as T };
+  } catch {
+    return { ok: false, status: 502, text: "invalid JSON from Misskey" };
+  }
+}
+
+/** Resolve local username to user id (Misskey /api/users/show). */
+export async function resolveUsernameToUserId(
+  env: Env,
+  username: string
+): Promise<string | null> {
+  const r = await misskeyApi<{ id: string }>(env, "/users/show", {
+    username
+  });
+  if (!r.ok || !r.data?.id) return null;
+  return r.data.id;
+}
+
+/**
+ * Send one or more direct-style notes (visibility specified) to the given
+ * local usernames. Resolves IDs with rate-limited API calls; chunks recipients.
+ */
+export async function sendDirectMessage(
+  env: Env,
+  users: string[],
+  text: string
+): Promise<{ sent: number; errors: string[] }> {
+  const errors: string[] = [];
+  const ids: string[] = [];
+
+  for (const u of users) {
+    const id = await resolveUsernameToUserId(env, u);
+    if (!id) {
+      errors.push(`users/show failed or unknown user: ${u}`);
+    } else {
+      ids.push(id);
+    }
+    await sleep(API_CALL_GAP_MS);
+  }
+
+  if (ids.length === 0) {
+    return { sent: 0, errors };
+  }
+
+  const uniqueIds = [...new Set(ids)];
+  let sent = 0;
+
+  for (let i = 0; i < uniqueIds.length; i += MAX_VISIBLE_USERS_PER_NOTE) {
+    const chunk = uniqueIds.slice(i, i + MAX_VISIBLE_USERS_PER_NOTE);
+    const r = await misskeyApi<unknown>(env, "/notes/create", {
+      text,
+      visibility: "specified",
+      visibleUserIds: chunk
+    });
+    if (!r.ok) {
+      errors.push(
+        `notes/create failed (${r.status}): ${r.text.slice(0, 500)}`
+      );
+    } else {
+      sent += chunk.length;
+    }
+    await sleep(API_CALL_GAP_MS);
+  }
+
+  return { sent, errors };
+}
+
+type OutEvent =
+  | { type: "notify"; header: string; body: string; icon?: string; ts: number }
+  | { type: "toast"; body: string; ts: number }
+  | {
+      type: "dialog";
+      title: string;
+      body: string;
+      kind?: UiKind;
+      ts: number;
+    }
+  | {
+      type: "confirm";
+      title: string;
+      body: string;
+      url: string;
+      kind?: UiKind;
+      ts: number;
+    };
+
+type UiKind = "info" | "success" | "warning" | "error" | "question";
+
+function withOk(url: string): string {
+  return url.includes("?") ? `${url}&ok=1` : `${url}?ok=1`;
+}
+
+function eventToMisskeyText(ev: OutEvent): string {
+  switch (ev.type) {
+    case "toast":
+      return ev.body;
+    case "notify":
+      return `${ev.header}\n${ev.body}`;
+    case "dialog":
+      return `${ev.title}\n${ev.body}`;
+    case "confirm":
+      return `${ev.title}\n${ev.body}\n${withOk(ev.url)}`;
+    default: {
+      const _x: never = ev;
+      return _x;
+    }
+  }
+}
+
 function s(v: unknown): string | undefined {
   if (typeof v !== "string") return undefined;
   const t = v.trim();
   return t ? t : undefined;
 }
-
-type UiKind = "info" | "success" | "warning" | "error" | "question";
 
 function kind(v: unknown): UiKind | undefined {
   if (
@@ -148,9 +287,7 @@ function buildEvent(payload: Record<string, unknown>): OutEvent | null {
       JSON.stringify(payload);
 
     const header =
-      s(payload.header) ||
-      s(payload.title) ||
-      "Webhook";
+      s(payload.header) || s(payload.title) || "Webhook";
 
     const icon = s(payload.icon);
 
@@ -161,9 +298,7 @@ function buildEvent(payload: Record<string, unknown>): OutEvent | null {
 
   if (type === "toast") {
     const body =
-      s(payload.body) ||
-      s(payload.text) ||
-      s(payload.message);
+      s(payload.body) || s(payload.text) || s(payload.message);
 
     if (!body) return null;
 
@@ -196,45 +331,4 @@ function buildEvent(payload: Record<string, unknown>): OutEvent | null {
   }
 
   return null;
-}
-
-export class UserRoom extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    // WebSocket connect
-    if (url.pathname.startsWith("/ws/")) {
-      if (request.headers.get("Upgrade") !== "websocket") {
-        return new Response("Expected websocket", { status: 426 });
-      }
-
-      const pair = new WebSocketPair();
-      const client = pair[0];
-      const server = pair[1];
-
-      this.ctx.acceptWebSocket(server);
-      server.send(JSON.stringify({ type: "hello" }));
-
-      return new Response(null, { status: 101, webSocket: client });
-    }
-
-    // Publish event
-    if (url.pathname === "/publish" && request.method === "POST") {
-      const msg = await request.text();
-
-      for (const ws of this.ctx.getWebSockets()) {
-        try {
-          ws.send(msg);
-        } catch {}
-      }
-
-      return new Response(null, { status: 204 });
-    }
-
-    return new Response("Not found", { status: 404 });
-  }
 }

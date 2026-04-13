@@ -3,29 +3,13 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-03-25",
 
-  // Enable Durable Objects for per-username WebSocket rooms
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "CORETALK_HOOKS_ROOMS",
-        "class_name": "UserRoom"
-      }
-    ]
+  "vars": {
+    "MISSKEY_ORIGIN": "https://coretalk.space"
   },
 
-  // Migrations required for Durable Objects
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_classes": ["UserRoom"]
-    }
-  ],
+  // MISSKEY_TOKEN: wrangler secret put MISSKEY_TOKEN
+  // ALLOWED_IPS: wrangler secret put ALLOWED_IPS (JSON string or array)
 
-  // IP whitelist: set via `wrangler secret put ALLOWED_IPS` (prod) or .dev.vars (local).
-  // Value must be JSON: a single IP as a JSON string, e.g. "203.0.113.10"
-  // or multiple IPs as a JSON array, e.g. ["203.0.113.10","198.51.100.7"]
-
-  // Optional: custom hostname (no path or * — required for custom_domain)
   "routes": [
     {
       "pattern": "hooks.coretalk.space",
@@ -33,7 +17,6 @@
     }
   ],
 
-  // Enable observability (optional but useful)
   "observability": {
     "enabled": true
   }
