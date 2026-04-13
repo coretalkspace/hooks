@@ -166,8 +166,10 @@ export async function resolveUsernameToUserId(
 }
 
 /**
- * Send one or more direct-style notes (visibility specified) to the given
- * local usernames. Resolves IDs with rate-limited API calls; chunks recipients.
+ * Send direct-style notes (`visibility: specified`, `localOnly`) so Misskey
+ * delivers a **mention** notification to each recipient’s bell (see Misskey
+ * NoteCreateService: visible users are queued as mentions). There is no API to
+ * call `notifications/create` for other users’ accounts with a single bot token.
  */
 export async function sendDirectMessage(
   env: Env,
@@ -175,31 +177,37 @@ export async function sendDirectMessage(
   text: string
 ): Promise<{ sent: number; errors: string[] }> {
   const errors: string[] = [];
-  const ids: string[] = [];
+  const pairs: { user: string; id: string }[] = [];
+  const seenId = new Set<string>();
 
   for (const u of users) {
     const id = await resolveUsernameToUserId(env, u);
     if (!id) {
       errors.push(`users/show failed or unknown user: ${u}`);
-    } else {
-      ids.push(id);
+    } else if (!seenId.has(id)) {
+      seenId.add(id);
+      pairs.push({ user: u, id });
     }
     await sleep(API_CALL_GAP_MS);
   }
 
-  if (ids.length === 0) {
+  if (pairs.length === 0) {
     return { sent: 0, errors };
   }
 
-  const uniqueIds = [...new Set(ids)];
   let sent = 0;
 
-  for (let i = 0; i < uniqueIds.length; i += MAX_VISIBLE_USERS_PER_NOTE) {
-    const chunk = uniqueIds.slice(i, i + MAX_VISIBLE_USERS_PER_NOTE);
+  for (let i = 0; i < pairs.length; i += MAX_VISIBLE_USERS_PER_NOTE) {
+    const chunk = pairs.slice(i, i + MAX_VISIBLE_USERS_PER_NOTE);
+    const visibleUserIds = chunk.map((p) => p.id);
+    const mentionLine = chunk.map((p) => `@${p.user}`).join(" ");
+    const noteText = `${mentionLine}\n${text}`;
+
     const r = await misskeyApi<unknown>(env, "/notes/create", {
-      text,
+      text: noteText,
       visibility: "specified",
-      visibleUserIds: chunk
+      visibleUserIds,
+      localOnly: true
     });
     if (!r.ok) {
       errors.push(
